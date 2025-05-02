@@ -4,7 +4,6 @@
 #include <time.h>
 #include <pthread.h>
 
-// Simple hash function (same as before)
 void simple_hash(const char* str, char output[65]) {
     unsigned long hash = 5381;
     int c;
@@ -14,7 +13,6 @@ void simple_hash(const char* str, char output[65]) {
     snprintf(output, 65, "%016lx%016lx%016lx%016lx", hash, hash, hash, hash);
 }
 
-// Transaction structure
 typedef struct {
     char sender[50];
     char receiver[50];
@@ -22,7 +20,6 @@ typedef struct {
     time_t timestamp;
 } Transaction;
 
-// Block structure
 typedef struct Block {
     int index;
     time_t timestamp;
@@ -33,7 +30,6 @@ typedef struct Block {
     struct Block* next;
 } Block;
 
-// Blockchain structure
 typedef struct {
     Block* head;
     Block* tail;
@@ -41,7 +37,6 @@ typedef struct {
     pthread_mutex_t lock;
 } Blockchain;
 
-// Node structure (represents a network node)
 typedef struct {
     int id;
     Blockchain blockchain;
@@ -49,19 +44,16 @@ typedef struct {
     int running;
 } Node;
 
-// Network of nodes
 #define MAX_NODES 5
 Node network[MAX_NODES];
 int node_count = 0;
 
-// Function prototypes
 Block* create_block(int index, const char* previous_hash, Transaction* transactions, int count);
 void add_block(Blockchain* blockchain, Block* block);
 void print_blockchain(const Blockchain* blockchain);
 void* node_process(void* arg);
 void broadcast_block(int sender_id, Block* block);
 
-// Create a new block
 Block* create_block(int index, const char* previous_hash, Transaction* transactions, int count) {
     Block* block = (Block*)malloc(sizeof(Block));
     if (!block) return NULL;
@@ -71,7 +63,6 @@ Block* create_block(int index, const char* previous_hash, Transaction* transacti
     block->transaction_count = count;
     strncpy(block->previous_hash, previous_hash, sizeof(block->previous_hash) - 1);
 
-    // Copy transactions
     block->transactions = (Transaction*)malloc(count * sizeof(Transaction));
     if (!block->transactions) {
         free(block);
@@ -79,7 +70,6 @@ Block* create_block(int index, const char* previous_hash, Transaction* transacti
     }
     memcpy(block->transactions, transactions, count * sizeof(Transaction));
 
-    // Calculate block hash (simplified)
     char buffer[1024];
     snprintf(buffer, sizeof(buffer), "%d%ld%s%d", index, block->timestamp, previous_hash, count);
     simple_hash(buffer, block->hash);
@@ -88,7 +78,6 @@ Block* create_block(int index, const char* previous_hash, Transaction* transacti
     return block;
 }
 
-// Add block to blockchain
 void add_block(Blockchain* blockchain, Block* block) {
     pthread_mutex_lock(&blockchain->lock);
 
@@ -104,7 +93,6 @@ void add_block(Blockchain* blockchain, Block* block) {
     pthread_mutex_unlock(&blockchain->lock);
 }
 
-// Print blockchain
 void print_blockchain(const Blockchain* blockchain) {
     Block* current = blockchain->head;
     printf("Blockchain (length: %d):\n", blockchain->length);
@@ -116,15 +104,12 @@ void print_blockchain(const Blockchain* blockchain) {
     printf("\n");
 }
 
-// Node process function (runs in a thread)
 void* node_process(void* arg) {
     Node* node = (Node*)arg;
     printf("Node %d started\n", node->id);
 
     while (node->running) {
-        // Simulate occasional block creation
         if (rand() % 10 == 0 && node->blockchain.length < 5) {
-            // Create a new block
             Transaction tx = {
                 .sender = "Node",
                 .receiver = "Network",
@@ -144,7 +129,6 @@ void* node_process(void* arg) {
             }
         }
 
-        // Sleep for a bit
         struct timespec ts = {0, 100000000}; // 100ms
         nanosleep(&ts, NULL);
     }
@@ -153,7 +137,6 @@ void* node_process(void* arg) {
     return NULL;
 }
 
-// Broadcast block to other nodes
 void broadcast_block(int sender_id, Block* block) {
     for (int i = 0; i < node_count; i++) {
         if (i != sender_id) {
@@ -181,7 +164,6 @@ void broadcast_block(int sender_id, Block* block) {
     }
 }
 
-// Initialize a node
 void init_node(int id) {
     if (node_count >= MAX_NODES) return;
 
@@ -206,7 +188,6 @@ void init_node(int id) {
     node_count++;
 }
 
-// Stop all nodes
 void stop_nodes() {
     for (int i = 0; i < node_count; i++) {
         network[i].running = 0;
@@ -220,18 +201,14 @@ int main() {
 
     printf("=== Blockchain Network Simulation ===\n");
 
-    // Initialize nodes
     for (int i = 0; i < 3; i++) {
         init_node(i);
     }
 
-    // Let the simulation run for 5 seconds
     sleep(5);
 
-    // Stop nodes
     stop_nodes();
 
-    // Print final blockchains
     printf("\nFinal blockchains:\n");
     for (int i = 0; i < node_count; i++) {
         printf("\nNode %d blockchain:\n", i);
