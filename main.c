@@ -46,6 +46,7 @@ typedef struct {
     pthread_t thread;
     bool running;
     double total_rewards;
+    bool is_malicious;
 } Node;
 
 Account accounts[NUM_NODES];
@@ -251,6 +252,12 @@ void* mine_block(void* arg) {
 
         pthread_mutex_lock(&mining_lock);
         while (!found && !block_found && node->running) {
+            // For malicious nodes (Part 3), sometimes skip mining
+            if (node->is_malicious && rand() % 2 == 0) {
+                printf("Malicious node %d skipping mining round\n", node->id);
+                break;
+            }
+
             // Get the last proof from this node's blockchain
             pthread_mutex_lock(&node->blockchain.lock);
             long last_proof = node->blockchain.current_proof;
@@ -271,6 +278,12 @@ void* mine_block(void* arg) {
 
                 Block* new_block = create_block(node->blockchain.length, prev_hash, current_txs, proof);
 
+                // Malicious nodes might tamper with the block (Part 3)
+                if (node->is_malicious && rand() % 2 == 0) {
+                    printf("Malicious node %d tampering with block!\n", node->id);
+                    new_block->transactions[0].amount *= 2; // Double the first transaction
+                }
+
                 printf("\nNode %d mined block %d with proof %ld\n",
                       node->id, new_block->index, proof);
 
@@ -289,7 +302,8 @@ void* mine_block(void* arg) {
 
     return NULL;
 }
-void init_network() {
+
+void init_network(bool with_malicious, int malicious_count) {
     // Initialize accounts
     for (int i = 0; i < NUM_NODES; i++) {
         sprintf(accounts[i].address, "Node%d", i);
@@ -306,7 +320,8 @@ void init_network() {
         network[i].blockchain.tail = NULL;
         network[i].blockchain.length = 0;
         network[i].blockchain.current_proof = 0;
-        network[i].total_rewards = 0.0;  // Initialize rewards to 0
+        network[i].total_rewards = 0.0;
+        network[i].is_malicious = with_malicious && (i < malicious_count); // Set malicious flag
         pthread_mutex_init(&network[i].blockchain.lock, NULL);
 
         add_block_to_chain(&network[i], genesis, 0);
@@ -315,7 +330,6 @@ void init_network() {
     }
     free(genesis);
 }
-
 
 void stop_network() {
     for (int i = 0; i < NUM_NODES; i++) {
@@ -363,11 +377,14 @@ void print_balances() {
         printf("%s: %.2f\n", accounts[i].address, accounts[i].balance);
     }
 }
-int main() {
-    srand(time(NULL));
-    init_network();
 
-    // Create some initial transactions
+void test_part1_valid_transactions() {
+    printf("\n=== PART 1: TESTING VALID TRANSACTIONS ===\n");
+
+    // Initialize network with no malicious nodes
+    init_network(false, 0);
+
+    // Create valid transactions
     Transaction tx1 = {"Node0", "Node1", 10.0, time(NULL)};
     Transaction tx2 = {"Node1", "Node2", 5.0, time(NULL)};
     Transaction tx3 = {"Node2", "Node3", 15.0, time(NULL)};
@@ -392,10 +409,100 @@ int main() {
     add_transaction(tx9);
     sleep(2);
 
+    // Display blockchain state for each node
     print_blockchain();
     print_balances();
-    print_rewards();  // Add this line to display rewards
+    print_rewards();
 
-    stop_network();
+    //stop_network();
+}
+
+void test_part2_invalid_transactions() {
+    printf("\n=== PART 2: TESTING INVALID TRANSACTIONS ===\n");
+
+    // Initialize network with no malicious nodes
+    init_network(false, 0);
+
+    // Create both valid and invalid transactions
+    Transaction valid_tx = {"Node0", "Node1", 10.0, time(NULL)};
+    Transaction invalid_tx1 = {"Node0", "Node1", 200.0, time(NULL)}; // Too much
+    Transaction invalid_tx2 = {"NodeX", "Node1", 5.0, time(NULL)};    // Invalid sender
+
+    printf("Adding valid transaction...\n");
+    add_transaction(valid_tx);
+
+    printf("\nAttempting invalid transaction (insufficient funds)...\n");
+    add_transaction(invalid_tx1);
+
+    printf("\nAttempting invalid transaction (unknown sender)...\n");
+    add_transaction(invalid_tx2);
+
+    sleep(2);
+
+    // Display blockchain state - should only show the valid transaction
+    print_blockchain();
+    print_balances();
+    print_rewards();
+
+    //stop_network();
+}
+
+void test_part3_malicious_nodes(int malicious_count) {
+    printf("\n=== PART 3: TESTING WITH %d MALICIOUS NODES ===\n", malicious_count);
+
+    // Initialize network with specified number of malicious nodes
+    init_network(true, malicious_count);
+
+    // Print which nodes are malicious
+    printf("Malicious nodes: ");
+    for (int i = 0; i < NUM_NODES; i++) {
+        if (network[i].is_malicious) {
+            printf("%d ", i);
+        }
+    }
+    printf("\n");
+
+    // Create some transactions
+    Transaction tx1 = {"Node0", "Node1", 10.0, time(NULL)};
+    Transaction tx2 = {"Node1", "Node2", 5.0, time(NULL)};
+    Transaction tx3 = {"Node2", "Node3", 15.0, time(NULL)};
+
+    printf("Adding transactions to network with malicious nodes...\n");
+    add_transaction(tx1);
+    add_transaction(tx2);
+    add_transaction(tx3);
+    sleep(2);
+
+    // Add more transactions to see behavior
+    Transaction tx4 = {"Node3", "Node4", 8.0, time(NULL)};
+    Transaction tx5 = {"Node4", "Node5", 12.0, time(NULL)};
+    add_transaction(tx4);
+    add_transaction(tx5);
+    sleep(2);
+
+    // Display results
+    print_blockchain();
+    print_balances();
+    print_rewards();
+
+    //stop_network();
+}
+
+int main() {
+    srand(time(NULL));
+
+    // Part 1: Test valid transactions
+    test_part1_valid_transactions();
+
+    // Part 2: Test invalid transactions
+    test_part2_invalid_transactions();
+
+    // Part 3: Test with malicious nodes
+    // First with <50% malicious nodes (2 out of 8)
+    test_part3_malicious_nodes(2);
+
+    // Then with >50% malicious nodes (5 out of 8)
+    test_part3_malicious_nodes(5);
+
     return 0;
 }
