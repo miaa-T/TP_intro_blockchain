@@ -45,6 +45,7 @@ typedef struct {
     Blockchain blockchain;
     pthread_t thread;
     bool running;
+    double total_rewards;
 } Node;
 
 Account accounts[NUM_NODES];
@@ -160,7 +161,6 @@ void add_transaction(Transaction tx) {
 
     pthread_mutex_unlock(&transaction_lock);
 }
-
 void update_balances(Transaction txs[TRANSACTIONS_PER_BLOCK], int miner_id) {
     pthread_mutex_lock(&balance_lock);
 
@@ -182,11 +182,21 @@ void update_balances(Transaction txs[TRANSACTIONS_PER_BLOCK], int miner_id) {
     // Add mining reward
     if (miner_id >= 0 && miner_id < NUM_NODES) {
         accounts[miner_id].balance += REWARD_AMOUNT;
+        network[miner_id].total_rewards += REWARD_AMOUNT;  // Track the reward
         printf("Node %d received mining reward (%.2f)\n", miner_id, REWARD_AMOUNT);
     }
 
     pthread_mutex_unlock(&balance_lock);
 }
+
+// Add this function to display rewards
+void print_rewards() {
+    printf("\nMining Rewards Summary:\n");
+    for (int i = 0; i < NUM_NODES; i++) {
+        printf("Node %d received %.2f in mining rewards\n", i, network[i].total_rewards);
+    }
+}
+
 
 void add_block_to_chain(Node* node, Block* block, long proof) {
     pthread_mutex_lock(&node->blockchain.lock);
@@ -279,7 +289,6 @@ void* mine_block(void* arg) {
 
     return NULL;
 }
-
 void init_network() {
     // Initialize accounts
     for (int i = 0; i < NUM_NODES; i++) {
@@ -297,6 +306,7 @@ void init_network() {
         network[i].blockchain.tail = NULL;
         network[i].blockchain.length = 0;
         network[i].blockchain.current_proof = 0;
+        network[i].total_rewards = 0.0;  // Initialize rewards to 0
         pthread_mutex_init(&network[i].blockchain.lock, NULL);
 
         add_block_to_chain(&network[i], genesis, 0);
@@ -305,6 +315,7 @@ void init_network() {
     }
     free(genesis);
 }
+
 
 void stop_network() {
     for (int i = 0; i < NUM_NODES; i++) {
@@ -352,7 +363,6 @@ void print_balances() {
         printf("%s: %.2f\n", accounts[i].address, accounts[i].balance);
     }
 }
-
 int main() {
     srand(time(NULL));
     init_network();
@@ -384,6 +394,7 @@ int main() {
 
     print_blockchain();
     print_balances();
+    print_rewards();  // Add this line to display rewards
 
     stop_network();
     return 0;
