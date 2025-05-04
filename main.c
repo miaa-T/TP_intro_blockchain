@@ -29,8 +29,6 @@ typedef struct Block {
     Transaction transactions[TRANSACTIONS_PER_BLOCK];
     char previous_hash[65];
     char hash[65];
-    long proof;
-    int miner_id;
     struct Block* next;
 } Block;
 
@@ -38,6 +36,7 @@ typedef struct {
     Block* head;
     Block* tail;
     int length;
+    long current_proof;  // Moved proof to blockchain level
     pthread_mutex_t lock;
 } Blockchain;
 
@@ -69,13 +68,21 @@ void simple_hash(const char* str, char output[65]) {
     snprintf(output, 65, "%016lx%016lx%016lx%016lx", hash, hash, hash, hash);
 }
 
+long calculate_next_proof(long last_proof) {
+    long proof = last_proof;
+    while (true) {
+        proof++;
+        if ((proof % 2 != 0) && (proof % 3 == 0)) {
+            return proof;
+        }
+    }
+}
+
 Block* create_genesis_block() {
     Block* block = (Block*)malloc(sizeof(Block));
     block->index = 0;
     block->timestamp = time(NULL);
     strcpy(block->previous_hash, "0");
-    block->proof = 0;
-    block->miner_id = -1;
     block->next = NULL;
 
     // Initialize empty transactions
@@ -87,21 +94,19 @@ Block* create_genesis_block() {
     }
 
     char buffer[256];
-    snprintf(buffer, sizeof(buffer), "%d%ld%s%ld",
-             block->index, block->timestamp, block->previous_hash, block->proof);
+    snprintf(buffer, sizeof(buffer), "%d%ld%s",
+             block->index, block->timestamp, block->previous_hash);
     simple_hash(buffer, block->hash);
 
     return block;
 }
 
-Block* create_block(int index, const char* previous_hash, Transaction txs[TRANSACTIONS_PER_BLOCK], long proof, int miner_id) {
+Block* create_block(int index, const char* previous_hash, Transaction txs[TRANSACTIONS_PER_BLOCK], long proof) {
     Block* block = (Block*)malloc(sizeof(Block));
     block->index = index;
     block->timestamp = time(NULL);
     memcpy(block->transactions, txs, sizeof(Transaction) * TRANSACTIONS_PER_BLOCK);
     strcpy(block->previous_hash, previous_hash);
-    block->proof = proof;
-    block->miner_id = miner_id;
     block->next = NULL;
 
     char buffer[2048];
@@ -114,14 +119,10 @@ Block* create_block(int index, const char* previous_hash, Transaction txs[TRANSA
     }
 
     snprintf(buffer, sizeof(buffer), "%d%ld%s%ld%s",
-             block->index, block->timestamp, block->previous_hash, block->proof, tx_data);
+             block->index, block->timestamp, block->previous_hash, proof, tx_data);
     simple_hash(buffer, block->hash);
 
     return block;
-}
-
-bool validate_proof(long proof) {
-    return (proof % 2 != 0) && (proof % 3 == 0);
 }
 
 bool validate_transaction(Transaction tx) {
@@ -166,7 +167,7 @@ void update_balances(Transaction txs[TRANSACTIONS_PER_BLOCK], int miner_id) {
     // Update balances from transactions
     for (int i = 0; i < TRANSACTIONS_PER_BLOCK; i++) {
         Transaction tx = txs[i];
-        if (strlen(tx.sender) == 0) continue; // Skip empty transactions
+        if (strlen(tx.sender) == 0) continue;
 
         for (int j = 0; j < NUM_NODES; j++) {
             if (strcmp(accounts[j].address, tx.sender) == 0) {
@@ -178,7 +179,7 @@ void update_balances(Transaction txs[TRANSACTIONS_PER_BLOCK], int miner_id) {
         }
     }
 
-    // Add mining reward (only once)
+    // Add mining reward
     if (miner_id >= 0 && miner_id < NUM_NODES) {
         accounts[miner_id].balance += REWARD_AMOUNT;
         printf("Node %d received mining reward (%.2f)\n", miner_id, REWARD_AMOUNT);
@@ -187,7 +188,7 @@ void update_balances(Transaction txs[TRANSACTIONS_PER_BLOCK], int miner_id) {
     pthread_mutex_unlock(&balance_lock);
 }
 
-void add_block_to_chain(Node* node, Block* block) {
+void add_block_to_chain(Node* node, Block* block, long proof) {
     pthread_mutex_lock(&node->blockchain.lock);
 
     if (node->blockchain.head == NULL) {
@@ -198,14 +199,15 @@ void add_block_to_chain(Node* node, Block* block) {
         node->blockchain.tail = block;
     }
     node->blockchain.length++;
+    node->blockchain.current_proof = proof;
 
     pthread_mutex_unlock(&node->blockchain.lock);
 }
 
-void broadcast_block(Block* block) {
+void broadcast_block(Block* block, long proof, int miner_id) {
     // Update balances only once
-    if (block->index > 0) { // Skip genesis block
-        update_balances(block->transactions, block->miner_id);
+    if (block->index > 0) {
+        update_balances(block->transactions, miner_id);
     }
 
     // Create a copy of the block for each node
@@ -213,7 +215,7 @@ void broadcast_block(Block* block) {
         Block* block_copy = (Block*)malloc(sizeof(Block));
         memcpy(block_copy, block, sizeof(Block));
         block_copy->next = NULL;
-        add_block_to_chain(&network[i], block_copy);
+        add_block_to_chain(&network[i], block_copy, proof);
     }
 }
 
@@ -235,39 +237,41 @@ void* mine_block(void* arg) {
         memcpy(current_txs, pending_transactions, sizeof(Transaction) * TRANSACTIONS_PER_BLOCK);
         pthread_mutex_unlock(&transaction_lock);
 
-        long proof = 0;
         bool found = false;
 
         pthread_mutex_lock(&mining_lock);
         while (!found && !block_found && node->running) {
-            proof++;
-            if (validate_proof(proof)) {
-                found = true;
-                if (!block_found) {
-                    block_found = true;
+            // Get the last proof from this node's blockchain
+            pthread_mutex_lock(&node->blockchain.lock);
+            long last_proof = node->blockchain.current_proof;
+            pthread_mutex_unlock(&node->blockchain.lock);
 
-                    char prev_hash[65];
-                    if (node->blockchain.tail) {
-                        strcpy(prev_hash, node->blockchain.tail->hash);
-                    } else {
-                        strcpy(prev_hash, "0");
-                    }
+            long proof = calculate_next_proof(last_proof);
 
-                    Block* new_block = create_block(node->blockchain.length, prev_hash,
-                                                  current_txs, proof, node->id);
+            found = true;
+            if (!block_found) {
+                block_found = true;
 
-                    printf("\nNode %d mined block %d with proof %ld\n",
-                          node->id, new_block->index, new_block->proof);
-
-                    broadcast_block(new_block);
-                    free(new_block); // Free the original after broadcasting
-
-                    // Reset for next block
-                    pthread_mutex_lock(&transaction_lock);
-                    pending_transaction_count = 0;
-                    mining = false;
-                    pthread_mutex_unlock(&transaction_lock);
+                char prev_hash[65];
+                if (node->blockchain.tail) {
+                    strcpy(prev_hash, node->blockchain.tail->hash);
+                } else {
+                    strcpy(prev_hash, "0");
                 }
+
+                Block* new_block = create_block(node->blockchain.length, prev_hash, current_txs, proof);
+
+                printf("\nNode %d mined block %d with proof %ld\n",
+                      node->id, new_block->index, proof);
+
+                broadcast_block(new_block, proof, node->id);
+                free(new_block);
+
+                // Reset for next block
+                pthread_mutex_lock(&transaction_lock);
+                pending_transaction_count = 0;
+                mining = false;
+                pthread_mutex_unlock(&transaction_lock);
             }
         }
         pthread_mutex_unlock(&mining_lock);
@@ -292,13 +296,14 @@ void init_network() {
         network[i].blockchain.head = NULL;
         network[i].blockchain.tail = NULL;
         network[i].blockchain.length = 0;
+        network[i].blockchain.current_proof = 0;
         pthread_mutex_init(&network[i].blockchain.lock, NULL);
 
-        add_block_to_chain(&network[i], genesis);
+        add_block_to_chain(&network[i], genesis, 0);
 
         pthread_create(&network[i].thread, NULL, mine_block, &network[i]);
     }
-    free(genesis); // Free the original after all nodes have copies
+    free(genesis);
 }
 
 void stop_network() {
@@ -323,11 +328,11 @@ void stop_network() {
 void print_blockchain() {
     printf("\nBlockchain:\n");
     for (int i = 0; i < NUM_NODES; i++) {
-        printf("Node %d chain (length %d):\n", i, network[i].blockchain.length);
+        printf("Node %d chain (length %d, current proof: %ld):\n",
+              i, network[i].blockchain.length, network[i].blockchain.current_proof);
         Block* current = network[i].blockchain.head;
         while (current != NULL) {
-            printf("  Block %d [%s] (proof: %ld, miner: %d)\n",
-                  current->index, current->hash, current->proof, current->miner_id);
+            printf("  Block %d [%s]\n", current->index, current->hash);
             for (int j = 0; j < TRANSACTIONS_PER_BLOCK; j++) {
                 if (strlen(current->transactions[j].sender) > 0) {
                     printf("    %s -> %s: %.2f\n",
@@ -359,17 +364,23 @@ int main() {
     Transaction tx4 = {"Node3", "Node4", 8.0, time(NULL)};
     Transaction tx5 = {"Node4", "Node5", 12.0, time(NULL)};
     Transaction tx6 = {"Node5", "Node6", 7.0, time(NULL)};
-
+    Transaction tx7 = {"Node6", "Node5", 10.0, time(NULL)};
+    Transaction tx8 = {"Node7", "Node4", 5.0, time(NULL)};
+    Transaction tx9 = {"Node1", "Node3", 15.0, time(NULL)};
     printf("Adding transactions...\n");
     add_transaction(tx1);
     add_transaction(tx2);
     add_transaction(tx3);
-    sleep(2); // Wait for first block to be mined
+    sleep(2);
 
     add_transaction(tx4);
     add_transaction(tx5);
     add_transaction(tx6);
-    sleep(2); // Wait for second block to be mined
+    sleep(2);
+    add_transaction(tx7);
+    add_transaction(tx8);
+    add_transaction(tx9);
+    sleep(2);
 
     print_blockchain();
     print_balances();
