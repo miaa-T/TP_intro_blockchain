@@ -4,23 +4,18 @@
 #include <time.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <unistd.h>
 
-// Improved hash function (simplified SHA-256 like)
-void simple_hash(const char* str, char output[65]) {
-    unsigned long hash = 5381;
-    int c;
-    while ((c = *str++)) {
-        hash = ((hash << 5) + hash) + c;
-    }
-    snprintf(output, 65, "%016lx%016lx%016lx%016lx", hash, hash, hash, hash);
-}
+#define NUM_NODES 8
+#define TRANSACTIONS_PER_BLOCK 3
+#define REWARD_AMOUNT 1.0
+#define INITIAL_BALANCE 100.0
 
 typedef struct {
     char sender[50];
     char receiver[50];
     double amount;
     time_t timestamp;
-    char signature[65];
 } Transaction;
 
 typedef struct {
@@ -28,19 +23,14 @@ typedef struct {
     double balance;
 } Account;
 
-#define MAX_ACCOUNTS 100
-Account accounts[MAX_ACCOUNTS];
-int account_count = 0;
-pthread_mutex_t accounts_lock = PTHREAD_MUTEX_INITIALIZER;
-
 typedef struct Block {
     int index;
     time_t timestamp;
-    Transaction* transactions;
-    int transaction_count;
+    Transaction transactions[TRANSACTIONS_PER_BLOCK];
     char previous_hash[65];
     char hash[65];
-    int nonce;
+    long proof;
+    int miner_id;
     struct Block* next;
 } Block;
 
@@ -55,626 +45,335 @@ typedef struct {
     int id;
     Blockchain blockchain;
     pthread_t thread;
-    int running;
-    bool is_malicious;
-} Node; // pour le merkel tree
+    bool running;
+} Node;
 
-#define MAX_NODES 5
-Node network[MAX_NODES];
-int node_count = 0;
-
-#define MAX_PENDING_TRANSACTIONS 10
-Transaction pending_transactions[MAX_PENDING_TRANSACTIONS];
+Account accounts[NUM_NODES];
+Transaction pending_transactions[TRANSACTIONS_PER_BLOCK];
 int pending_transaction_count = 0;
-pthread_mutex_t pending_transactions_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t transaction_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t transaction_cond = PTHREAD_COND_INITIALIZER;
 
-// Function prototypes
-Block* create_block(int index, const char* previous_hash, Transaction* transactions, int count);
-void add_block(Blockchain* blockchain, Block* block);
-void print_blockchain(const Blockchain* blockchain);
-void* node_process(void* arg);
-void broadcast_block(int sender_id, Block* block);
-bool validate_transaction(Transaction* tx);
-bool validate_block(Block* block, const char* previous_hash);
-void mine_block(Block* block);
-Block* create_malicious_block(int index, const char* previous_hash, Transaction* transactions, int count);
-void add_transaction_to_pool(Transaction tx);
-void process_pending_transactions(Node* node);
-void init_accounts();
-void update_account_balances(Transaction* tx);
-void sign_transaction(Transaction* tx);
+Node network[NUM_NODES];
+bool mining = false;
+bool block_found = false;
+pthread_mutex_t mining_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t balance_lock = PTHREAD_MUTEX_INITIALIZER;
 
-// Consensus difficulty (5 leading zeros)
-#define CONSENSUS_TARGET "00000"
-
-// Create a new block (updated to include mining)
-Block* create_block(int index, const char* previous_hash, Transaction* transactions, int count) {
-    Block* block = (Block*)malloc(sizeof(Block));
-    if (!block) return NULL;
-
-    block->index = index;
-    block->timestamp = time(NULL);
-    block->transaction_count = count;
-    strncpy(block->previous_hash, previous_hash, sizeof(block->previous_hash) - 1);
-    block->nonce = 0;
-
-    block->transactions = (Transaction*)malloc(count * sizeof(Transaction));
-    if (!block->transactions) {
-        free(block);
-        return NULL;
+void simple_hash(const char* str, char output[65]) {
+    unsigned long hash = 5381;
+    int c;
+    while ((c = *str++)) {
+        hash = ((hash << 5) + hash) + c;
     }
-    memcpy(block->transactions, transactions, count * sizeof(Transaction));
-
-    // Mining process happens here
-    mine_block(block);
-
-    block->next = NULL;
-    return block;
+    snprintf(output, 65, "%016lx%016lx%016lx%016lx", hash, hash, hash, hash);
 }
 
-// Create a malicious block (doesn't follow consensus rules)
-Block* create_malicious_block(int index, const char* previous_hash, Transaction* transactions, int count) {
+Block* create_genesis_block() {
     Block* block = (Block*)malloc(sizeof(Block));
-    if (!block) return NULL;
-
-    block->index = index;
+    block->index = 0;
     block->timestamp = time(NULL);
-    block->transaction_count = count;
-    strncpy(block->previous_hash, previous_hash, sizeof(block->previous_hash) - 1);
-    block->nonce = 0;
+    strcpy(block->previous_hash, "0");
+    block->proof = 0;
+    block->miner_id = -1;
+    block->next = NULL;
 
-    block->transactions = (Transaction*)malloc(count * sizeof(Transaction));
-    if (!block->transactions) {
-        free(block);
-        return NULL;
+    // Initialize empty transactions
+    for (int i = 0; i < TRANSACTIONS_PER_BLOCK; i++) {
+        strcpy(block->transactions[i].sender, "");
+        strcpy(block->transactions[i].receiver, "");
+        block->transactions[i].amount = 0;
+        block->transactions[i].timestamp = 0;
     }
-    memcpy(block->transactions, transactions, count * sizeof(Transaction));
 
-    // Malicious node doesn't mine properly, just sets a fake hash
-    char buffer[1024];
-    snprintf(buffer, sizeof(buffer), "%d%ld%s%d", index, block->timestamp, previous_hash, block->nonce);
+    char buffer[256];
+    snprintf(buffer, sizeof(buffer), "%d%ld%s%ld",
+             block->index, block->timestamp, block->previous_hash, block->proof);
     simple_hash(buffer, block->hash);
 
-    // Forge the hash to look valid without actually mining
-    memcpy(block->hash, CONSENSUS_TARGET, strlen(CONSENSUS_TARGET));
-
-    block->next = NULL;
     return block;
 }
 
-// Mine a block (implement proof of work)
-void mine_block(Block* block) {
-    char buffer[1024];
-    bool found = false;
+Block* create_block(int index, const char* previous_hash, Transaction txs[TRANSACTIONS_PER_BLOCK], long proof, int miner_id) {
+    Block* block = (Block*)malloc(sizeof(Block));
+    block->index = index;
+    block->timestamp = time(NULL);
+    memcpy(block->transactions, txs, sizeof(Transaction) * TRANSACTIONS_PER_BLOCK);
+    strcpy(block->previous_hash, previous_hash);
+    block->proof = proof;
+    block->miner_id = miner_id;
+    block->next = NULL;
 
-    while (!found) {
-        snprintf(buffer, sizeof(buffer), "%d%ld%s%d%d",
-                 block->index, block->timestamp, block->previous_hash,
-                 block->transaction_count, block->nonce);
-
-        simple_hash(buffer, block->hash);
-
-        // Check if hash meets consensus requirement (starts with 5 zeros)
-        if (strncmp(block->hash, CONSENSUS_TARGET, strlen(CONSENSUS_TARGET)) == 0) {
-            found = true;
-        } else {
-            block->nonce++;
-        }
+    char buffer[2048];
+    char tx_data[1024] = "";
+    for (int i = 0; i < TRANSACTIONS_PER_BLOCK; i++) {
+        char temp[128];
+        snprintf(temp, sizeof(temp), "%s%s%.2f",
+                txs[i].sender, txs[i].receiver, txs[i].amount);
+        strcat(tx_data, temp);
     }
 
-    printf("Block mined with nonce: %d, hash: %s\n", block->nonce, block->hash);
+    snprintf(buffer, sizeof(buffer), "%d%ld%s%ld%s",
+             block->index, block->timestamp, block->previous_hash, block->proof, tx_data);
+    simple_hash(buffer, block->hash);
+
+    return block;
 }
 
-// Add block to the blockchain
-void add_block(Blockchain* blockchain, Block* block) {
-    pthread_mutex_lock(&blockchain->lock);
+bool validate_proof(long proof) {
+    return (proof % 2 != 0) && (proof % 3 == 0);
+}
 
-    if (blockchain->head == NULL) {
-        blockchain->head = block;
-        blockchain->tail = block;
+bool validate_transaction(Transaction tx) {
+    pthread_mutex_lock(&balance_lock);
+    bool valid = false;
+    for (int i = 0; i < NUM_NODES; i++) {
+        if (strcmp(accounts[i].address, tx.sender) == 0) {
+            valid = (accounts[i].balance >= tx.amount);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&balance_lock);
+    return valid;
+}
+
+void add_transaction(Transaction tx) {
+    pthread_mutex_lock(&transaction_lock);
+
+    if (pending_transaction_count < TRANSACTIONS_PER_BLOCK) {
+        if (validate_transaction(tx)) {
+            pending_transactions[pending_transaction_count++] = tx;
+            printf("Added transaction: %s -> %s (%.2f)\n", tx.sender, tx.receiver, tx.amount);
+
+            if (pending_transaction_count == TRANSACTIONS_PER_BLOCK) {
+                mining = true;
+                block_found = false;
+                pthread_cond_broadcast(&transaction_cond);
+            }
+        } else {
+            printf("Invalid transaction: %s doesn't have enough funds\n", tx.sender);
+        }
     } else {
-        // Verify block before adding
-        if (validate_block(block, blockchain->tail->hash)) {
-            blockchain->tail->next = block;
-            blockchain->tail = block;
-            blockchain->length++;
+        printf("Transaction pool is full. Waiting for block to be mined.\n");
+    }
 
-            // Update account balances
-            for (int i = 0; i < block->transaction_count; i++) {
-                update_account_balances(&block->transactions[i]);
+    pthread_mutex_unlock(&transaction_lock);
+}
+
+void update_balances(Transaction txs[TRANSACTIONS_PER_BLOCK], int miner_id) {
+    pthread_mutex_lock(&balance_lock);
+
+    // Update balances from transactions
+    for (int i = 0; i < TRANSACTIONS_PER_BLOCK; i++) {
+        Transaction tx = txs[i];
+        if (strlen(tx.sender) == 0) continue; // Skip empty transactions
+
+        for (int j = 0; j < NUM_NODES; j++) {
+            if (strcmp(accounts[j].address, tx.sender) == 0) {
+                accounts[j].balance -= tx.amount;
             }
-        } else {
-            printf("Invalid block rejected: %d\n", block->index);
-            free(block->transactions);
-            free(block);
-            pthread_mutex_unlock(&blockchain->lock);
-            return;
-        }
-    }
-
-    pthread_mutex_unlock(&blockchain->lock);
-}
-
-// Validate a block
-bool validate_block(Block* block, const char* previous_hash) {
-    // 1. Check previous hash matches
-    if (strcmp(block->previous_hash, previous_hash) != 0) {
-        printf("Previous hash mismatch\n");
-        return false;
-    }
-
-    // 2. Verify hash starts with the target number of zeros
-    if (strncmp(block->hash, CONSENSUS_TARGET, strlen(CONSENSUS_TARGET)) != 0) {
-        printf("Block hash doesn't meet consensus requirements\n");
-        return false;
-    }
-
-    // 3. Recalculate hash to verify it's correct
-    char buffer[1024];
-    char calculated_hash[65];
-
-    snprintf(buffer, sizeof(buffer), "%d%ld%s%d%d",
-             block->index, block->timestamp, block->previous_hash,
-             block->transaction_count, block->nonce);
-
-    simple_hash(buffer, calculated_hash);
-
-    if (strcmp(calculated_hash, block->hash) != 0) {
-        printf("Block hash verification failed\n");
-        return false;
-    }
-
-    // 4. Verify all transactions in the block are valid
-    for (int i = 0; i < block->transaction_count; i++) {
-        if (!validate_transaction(&block->transactions[i])) {
-            printf("Invalid transaction in block\n");
-            return false;
-        }
-    }
-
-    return true;
-}
-
-// Sign a transaction (simplified)
-void sign_transaction(Transaction* tx) {
-    char buffer[256];
-    snprintf(buffer, sizeof(buffer), "%s%s%.2f%ld",
-             tx->sender, tx->receiver, tx->amount, tx->timestamp);
-    simple_hash(buffer, tx->signature);
-}
-
-// Validate a transaction
-bool validate_transaction(Transaction* tx) {
-    // Check signature
-    char buffer[256];
-    char calculated_signature[65];
-
-    snprintf(buffer, sizeof(buffer), "%s%s%.2f%ld",
-             tx->sender, tx->receiver, tx->amount, tx->timestamp);
-    simple_hash(buffer, calculated_signature);
-
-    if (strcmp(calculated_signature, tx->signature) != 0) {
-        printf("Transaction signature invalid\n");
-        return false;
-    }
-
-    // Check sender has enough funds
-    pthread_mutex_lock(&accounts_lock);
-    for (int i = 0; i < account_count; i++) {
-        if (strcmp(accounts[i].address, tx->sender) == 0) {
-            if (accounts[i].balance < tx->amount) {
-                pthread_mutex_unlock(&accounts_lock);
-                printf("Insufficient funds: %s has only %.2f\n", tx->sender, accounts[i].balance);
-                return false;
-            }
-            pthread_mutex_unlock(&accounts_lock);
-            return true;
-        }
-    }
-    pthread_mutex_unlock(&accounts_lock);
-
-    // If we're sending from "System" for genesis, allow it
-    if (strcmp(tx->sender, "System") == 0) {
-        return true;
-    }
-
-    printf("Sender account not found: %s\n", tx->sender);
-    return false;
-}
-
-// Update account balances based on transaction
-void update_account_balances(Transaction* tx) {
-    pthread_mutex_lock(&accounts_lock);
-
-    // Skip system transactions
-    if (strcmp(tx->sender, "System") == 0) {
-        // Find receiver account or create it
-        bool receiver_found = false;
-        for (int i = 0; i < account_count; i++) {
-            if (strcmp(accounts[i].address, tx->receiver) == 0) {
-                accounts[i].balance += tx->amount;
-                receiver_found = true;
-                break;
-            }
-        }
-
-        if (!receiver_found && account_count < MAX_ACCOUNTS) {
-            strcpy(accounts[account_count].address, tx->receiver);
-            accounts[account_count].balance = tx->amount;
-            account_count++;
-        }
-
-        pthread_mutex_unlock(&accounts_lock);
-        return;
-    }
-
-    // Handle regular transactions
-    bool sender_found = false;
-    bool receiver_found = false;
-
-    for (int i = 0; i < account_count; i++) {
-        if (strcmp(accounts[i].address, tx->sender) == 0) {
-            accounts[i].balance -= tx->amount;
-            sender_found = true;
-        }
-
-        if (strcmp(accounts[i].address, tx->receiver) == 0) {
-            accounts[i].balance += tx->amount;
-            receiver_found = true;
-        }
-    }
-
-    // Create receiver account if not found
-    if (!receiver_found && account_count < MAX_ACCOUNTS) {
-        strcpy(accounts[account_count].address, tx->receiver);
-        accounts[account_count].balance = tx->amount;
-        account_count++;
-    }
-
-    pthread_mutex_unlock(&accounts_lock);
-}
-
-// Initialize accounts with some test balances
-void init_accounts() {
-    pthread_mutex_lock(&accounts_lock);
-
-    strcpy(accounts[0].address, "Node0");
-    accounts[0].balance = 100.0;
-
-    strcpy(accounts[1].address, "Node1");
-    accounts[1].balance = 100.0;
-
-    strcpy(accounts[2].address, "Node2");
-    accounts[2].balance = 100.0;
-
-    account_count = 3;
-
-    pthread_mutex_unlock(&accounts_lock);
-}
-
-// Print the blockchain
-void print_blockchain(const Blockchain* blockchain) {
-    Block* current = blockchain->head;
-    printf("Blockchain (length: %d):\n", blockchain->length);
-    while (current != NULL) {
-        printf("[%d] Hash: %s\n", current->index, current->hash);
-        printf("    Prev: %s\n", current->previous_hash);
-        printf("    Nonce: %d\n", current->nonce);
-        printf("    Transactions: %d\n", current->transaction_count);
-
-        for (int i = 0; i < current->transaction_count; i++) {
-            printf("    - %s -> %s: %.2f\n",
-                  current->transactions[i].sender,
-                  current->transactions[i].receiver,
-                  current->transactions[i].amount);
-        }
-
-        current = current->next;
-    }
-    printf("\n");
-}
-
-// Add transaction to the pending pool
-void add_transaction_to_pool(Transaction tx) {
-    pthread_mutex_lock(&pending_transactions_lock);
-
-    if (pending_transaction_count < MAX_PENDING_TRANSACTIONS) {
-        // Sign the transaction
-        sign_transaction(&tx);
-
-        if (validate_transaction(&tx)) {
-            memcpy(&pending_transactions[pending_transaction_count], &tx, sizeof(Transaction));
-            pending_transaction_count++;
-            printf("Transaction added to pool: %s -> %s: %.2f\n", tx.sender, tx.receiver, tx.amount);
-        } else {
-            printf("Invalid transaction rejected: %s -> %s: %.2f\n", tx.sender, tx.receiver, tx.amount);
-        }
-    }
-
-    pthread_mutex_unlock(&pending_transactions_lock);
-}
-
-// Process pending transactions
-void process_pending_transactions(Node* node) {
-    pthread_mutex_lock(&pending_transactions_lock);
-
-    if (pending_transaction_count > 0) {
-        int count = pending_transaction_count > 5 ? 5 : pending_transaction_count;
-        Transaction* transactions = (Transaction*)malloc(count * sizeof(Transaction));
-
-        if (transactions) {
-            memcpy(transactions, pending_transactions, count * sizeof(Transaction));
-
-            // Create a new block with these transactions
-            const char* prev_hash = node->blockchain.tail ? node->blockchain.tail->hash : "0";
-            Block* new_block;
-
-            if (node->is_malicious) {
-                printf("Node %d (malicious) creating block with %d transactions\n", node->id, count);
-                new_block = create_malicious_block(node->blockchain.length, prev_hash, transactions, count);
-            } else {
-                printf("Node %d creating block with %d transactions\n", node->id, count);
-                new_block = create_block(node->blockchain.length, prev_hash, transactions, count);
-            }
-
-            free(transactions);
-
-            if (new_block) {
-                add_block(&node->blockchain, new_block);
-                printf("Node %d created block %d\n", node->id, new_block->index);
-
-                // Broadcast to other nodes
-                broadcast_block(node->id, new_block);
-
-                // Remove processed transactions from pool
-                memmove(pending_transactions,
-                        &pending_transactions[count],
-                        (pending_transaction_count - count) * sizeof(Transaction));
-                pending_transaction_count -= count;
+            if (strcmp(accounts[j].address, tx.receiver) == 0) {
+                accounts[j].balance += tx.amount;
             }
         }
     }
 
-    pthread_mutex_unlock(&pending_transactions_lock);
+    // Add mining reward (only once)
+    if (miner_id >= 0 && miner_id < NUM_NODES) {
+        accounts[miner_id].balance += REWARD_AMOUNT;
+        printf("Node %d received mining reward (%.2f)\n", miner_id, REWARD_AMOUNT);
+    }
+
+    pthread_mutex_unlock(&balance_lock);
 }
 
-// Node process function
-void* node_process(void* arg) {
+void add_block_to_chain(Node* node, Block* block) {
+    pthread_mutex_lock(&node->blockchain.lock);
+
+    if (node->blockchain.head == NULL) {
+        node->blockchain.head = block;
+        node->blockchain.tail = block;
+    } else {
+        node->blockchain.tail->next = block;
+        node->blockchain.tail = block;
+    }
+    node->blockchain.length++;
+
+    pthread_mutex_unlock(&node->blockchain.lock);
+}
+
+void broadcast_block(Block* block) {
+    // Update balances only once
+    if (block->index > 0) { // Skip genesis block
+        update_balances(block->transactions, block->miner_id);
+    }
+
+    // Create a copy of the block for each node
+    for (int i = 0; i < NUM_NODES; i++) {
+        Block* block_copy = (Block*)malloc(sizeof(Block));
+        memcpy(block_copy, block, sizeof(Block));
+        block_copy->next = NULL;
+        add_block_to_chain(&network[i], block_copy);
+    }
+}
+
+void* mine_block(void* arg) {
     Node* node = (Node*)arg;
-    printf("Node %d started (malicious: %s)\n", node->id, node->is_malicious ? "yes" : "no");
 
     while (node->running) {
-        if (rand() % 10 == 0) {
-            Transaction tx;
-            sprintf(tx.sender, "Node%d", node->id);
-            sprintf(tx.receiver, "Node%d", rand() % node_count);
-            tx.amount = (rand() % 10) + 1;
-            tx.timestamp = time(NULL);
-
-            add_transaction_to_pool(tx);
+        pthread_mutex_lock(&transaction_lock);
+        while (!mining && node->running) {
+            pthread_cond_wait(&transaction_cond, &transaction_lock);
         }
 
-        process_pending_transactions(node);
+        if (!node->running) {
+            pthread_mutex_unlock(&transaction_lock);
+            break;
+        }
 
-        struct timespec ts = {0, 500000000}; // 500ms
-        nanosleep(&ts, NULL);
+        Transaction current_txs[TRANSACTIONS_PER_BLOCK];
+        memcpy(current_txs, pending_transactions, sizeof(Transaction) * TRANSACTIONS_PER_BLOCK);
+        pthread_mutex_unlock(&transaction_lock);
+
+        long proof = 0;
+        bool found = false;
+
+        pthread_mutex_lock(&mining_lock);
+        while (!found && !block_found && node->running) {
+            proof++;
+            if (validate_proof(proof)) {
+                found = true;
+                if (!block_found) {
+                    block_found = true;
+
+                    char prev_hash[65];
+                    if (node->blockchain.tail) {
+                        strcpy(prev_hash, node->blockchain.tail->hash);
+                    } else {
+                        strcpy(prev_hash, "0");
+                    }
+
+                    Block* new_block = create_block(node->blockchain.length, prev_hash,
+                                                  current_txs, proof, node->id);
+
+                    printf("\nNode %d mined block %d with proof %ld\n",
+                          node->id, new_block->index, new_block->proof);
+
+                    broadcast_block(new_block);
+                    free(new_block); // Free the original after broadcasting
+
+                    // Reset for next block
+                    pthread_mutex_lock(&transaction_lock);
+                    pending_transaction_count = 0;
+                    mining = false;
+                    pthread_mutex_unlock(&transaction_lock);
+                }
+            }
+        }
+        pthread_mutex_unlock(&mining_lock);
     }
 
-    printf("Node %d stopped\n", node->id);
     return NULL;
 }
 
-// Broadcast a block to other nodes
-void broadcast_block(int sender_id, Block* block) {
-    for (int i = 0; i < node_count; i++) {
-        if (i != sender_id) {
-
-            struct timespec ts = {0, (rand() % 200) * 1000000};//communication latency zaema
-            nanosleep(&ts, NULL);
-
-            if (rand() % 10 < 1) {
-                continue;
-            }
-
-            // Clone the block for the receiving node
-            Block* block_copy = (Block*)malloc(sizeof(Block));
-            if (!block_copy) continue;
-
-            memcpy(block_copy, block, sizeof(Block));
-
-            // Deep copy transactions
-            block_copy->transactions = (Transaction*)malloc(block->transaction_count * sizeof(Transaction));
-            if (!block_copy->transactions) {
-                free(block_copy);
-                continue;
-            }
-
-            memcpy(block_copy->transactions, block->transactions, block->transaction_count * sizeof(Transaction));
-            block_copy->next = NULL;
-
-            // Add the block to the receiving node's blockchain (validation happens in add_block)
-            add_block(&network[i].blockchain, block_copy);
-            printf("Block %d propagated from node %d to node %d\n", block->index, sender_id, i);
-        }
+void init_network() {
+    // Initialize accounts
+    for (int i = 0; i < NUM_NODES; i++) {
+        sprintf(accounts[i].address, "Node%d", i);
+        accounts[i].balance = INITIAL_BALANCE;
     }
+
+    // Create genesis block and initialize nodes
+    Block* genesis = create_genesis_block();
+
+    for (int i = 0; i < NUM_NODES; i++) {
+        network[i].id = i;
+        network[i].running = true;
+        network[i].blockchain.head = NULL;
+        network[i].blockchain.tail = NULL;
+        network[i].blockchain.length = 0;
+        pthread_mutex_init(&network[i].blockchain.lock, NULL);
+
+        add_block_to_chain(&network[i], genesis);
+
+        pthread_create(&network[i].thread, NULL, mine_block, &network[i]);
+    }
+    free(genesis); // Free the original after all nodes have copies
 }
 
-// Initialize a new node
-void init_node(int id, bool is_malicious) {
-    if (node_count >= MAX_NODES) return;
+void stop_network() {
+    for (int i = 0; i < NUM_NODES; i++) {
+        network[i].running = false;
+    }
 
-    network[node_count].id = id;
-    network[node_count].is_malicious = is_malicious;
-    network[node_count].blockchain.head = NULL;
-    network[node_count].blockchain.tail = NULL;
-    network[node_count].blockchain.length = 0;
-    network[node_count].running = 1;
-    pthread_mutex_init(&network[node_count].blockchain.lock, NULL);
+    pthread_cond_broadcast(&transaction_cond);
 
-    // Create genesis block for this node
-    Transaction genesis_tx = {
-        .sender = "mia",
-        .receiver = "mahdia",
-        .amount = 100.0,
-        .timestamp = time(NULL)
-    };
-    sign_transaction(&genesis_tx);
-
-    Block* genesis = create_block(0, "0", &genesis_tx, 1);
-    add_block(&network[node_count].blockchain, genesis);
-
-    pthread_create(&network[node_count].thread, NULL, node_process, &network[node_count]);
-    node_count++;
-}
-
-// Stop all nodes
-void stop_nodes() {
-    for (int i = 0; i < node_count; i++) {
-        network[i].running = 0;
+    for (int i = 0; i < NUM_NODES; i++) {
         pthread_join(network[i].thread, NULL);
-        pthread_mutex_destroy(&network[i].blockchain.lock);
-    }
-}
 
-// Print all account balances
-void print_account_balances() {
-    pthread_mutex_lock(&accounts_lock);
-
-    printf("\n=== Account Balances ===\n");
-    for (int i = 0; i < account_count; i++) {
-        printf("%s: %.2f coins\n", accounts[i].address, accounts[i].balance);
-    }
-
-    pthread_mutex_unlock(&accounts_lock);
-}
-
-// Read transactions from a specific block
-void read_block_transactions(const Blockchain* blockchain, int block_index) {
-    Block* current = blockchain->head;
-
-    while (current != NULL) {
-        if (current->index == block_index) {
-            printf("\n=== Transactions in Block %d ===\n", block_index);
-            for (int i = 0; i < current->transaction_count; i++) {
-                printf("[%d] %s -> %s: %.2f\n",
-                      i,
-                      current->transactions[i].sender,
-                      current->transactions[i].receiver,
-                      current->transactions[i].amount);
-            }
-            return;
+        Block* current = network[i].blockchain.head;
+        while (current != NULL) {
+            Block* next = current->next;
+            free(current);
+            current = next;
         }
-        current = current->next;
     }
-
-    printf("Block %d not found\n", block_index);
 }
 
-// TEST 1: Add a valid transaction
-void test_add_valid_transaction() {
-    printf("\n=== TEST 1: Adding a valid transaction ===\n");
-
-    Transaction tx = {
-        .sender = "Node0",
-        .receiver = "Node1",
-        .amount = 10.0,
-        .timestamp = time(NULL)
-    };
-
-    add_transaction_to_pool(tx);
-
-    // Let the system process it
-    sleep(2);
-
-    print_account_balances();
+void print_blockchain() {
+    printf("\nBlockchain:\n");
+    for (int i = 0; i < NUM_NODES; i++) {
+        printf("Node %d chain (length %d):\n", i, network[i].blockchain.length);
+        Block* current = network[i].blockchain.head;
+        while (current != NULL) {
+            printf("  Block %d [%s] (proof: %ld, miner: %d)\n",
+                  current->index, current->hash, current->proof, current->miner_id);
+            for (int j = 0; j < TRANSACTIONS_PER_BLOCK; j++) {
+                if (strlen(current->transactions[j].sender) > 0) {
+                    printf("    %s -> %s: %.2f\n",
+                          current->transactions[j].sender,
+                          current->transactions[j].receiver,
+                          current->transactions[j].amount);
+                }
+            }
+            current = current->next;
+        }
+    }
 }
 
-// TEST 2: Add an invalid transaction (insufficient funds)
-void test_add_invalid_transaction() {
-    printf("\n=== TEST 2: Adding an invalid transaction (insufficient funds) ===\n");
-
-    Transaction tx = {
-        .sender = "Node2",
-        .receiver = "Node0",
-        .amount = 1000.0, // More than available balance
-        .timestamp = time(NULL)
-    };
-
-    add_transaction_to_pool(tx);
-
-    // Let the system process it
-    sleep(2);
-
-    print_account_balances();
-}
-
-// TEST 3: Malicious miner test
-void test_malicious_miner() {
-    printf("\n=== TEST 3: Malicious miner attempting to add invalid blocks ===\n");
-
-    Transaction tx = {
-        .sender = "Node1",
-        .receiver = "Node2",
-        .amount = 5.0,
-        .timestamp = time(NULL)
-    };
-
-    add_transaction_to_pool(tx);
-
-    // Let the system process it
-    sleep(5);
-
-    // Compare blockchains
-    printf("\nComparing blockchains after malicious activity:\n");
-    for (int i = 0; i < node_count; i++) {
-        printf("\nNode %d blockchain (malicious: %s):\n",
-              i, network[i].is_malicious ? "yes" : "no");
-        print_blockchain(&network[i].blockchain);
+void print_balances() {
+    printf("\nAccount Balances:\n");
+    for (int i = 0; i < NUM_NODES; i++) {
+        printf("%s: %.2f\n", accounts[i].address, accounts[i].balance);
     }
 }
 
 int main() {
     srand(time(NULL));
+    init_network();
 
-    printf("=== Blockchain Network Simulation with Consensus ===\n");
+    // Create some initial transactions
+    Transaction tx1 = {"Node0", "Node1", 10.0, time(NULL)};
+    Transaction tx2 = {"Node1", "Node2", 5.0, time(NULL)};
+    Transaction tx3 = {"Node2", "Node3", 15.0, time(NULL)};
+    Transaction tx4 = {"Node3", "Node4", 8.0, time(NULL)};
+    Transaction tx5 = {"Node4", "Node5", 12.0, time(NULL)};
+    Transaction tx6 = {"Node5", "Node6", 7.0, time(NULL)};
 
-    // Initialize accounts
-    init_accounts();
+    printf("Adding transactions...\n");
+    add_transaction(tx1);
+    add_transaction(tx2);
+    add_transaction(tx3);
+    sleep(2); // Wait for first block to be mined
 
-    // Initialize regular nodes
-    init_node(0, false);
-    init_node(1, false);
+    add_transaction(tx4);
+    add_transaction(tx5);
+    add_transaction(tx6);
+    sleep(2); // Wait for second block to be mined
 
-    // Initialize a malicious node
-    init_node(2, true);
+    print_blockchain();
+    print_balances();
 
-    // Let the system run for a bit
-    printf("\nRunning network simulation for 3 seconds...\n");
-    sleep(3);
-
-    // Test 1: Add a valid transaction
-    test_add_valid_transaction();
-
-    // Test 2: Add an invalid transaction
-    test_add_invalid_transaction();
-
-    // Test 3: Malicious miner test
-    test_malicious_miner();
-
-    // Read transactions from a block
-    printf("\nReading transactions from blockchain:\n");
-    read_block_transactions(&network[0].blockchain, 1);
-
-    // Stop simulation
-    stop_nodes();
-
-    printf("\nFinal blockchains:\n");
-    for (int i = 0; i < node_count; i++) {
-        printf("\nNode %d blockchain (malicious: %s):\n", i, network[i].is_malicious ? "yes" : "no");
-        print_blockchain(&network[i].blockchain);
-    }
-
-    print_account_balances();
-
+    stop_network();
     return 0;
 }
